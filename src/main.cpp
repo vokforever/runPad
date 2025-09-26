@@ -308,6 +308,7 @@ void treadmillDataCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
   static std::vector<uint8_t> lastData;
   std::vector<uint8_t> currentDataVec(pData, pData + length);
   
+  // Выводим RAW DATA только при изменении данных
   if (currentDataVec != lastData) {
     Serial0.print("RAW DATA: ");
     for (size_t i = 0; i < length; i++) {
@@ -315,7 +316,6 @@ void treadmillDataCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
     }
     Serial0.println();
     
-    // Детальный анализ пакета
     Serial0.printf("Analysis: Flags=0x%04X, Bytes[2-3]=0x%04X (%d), Bytes[4-6]=0x%06X, Bytes[16-17]=0x%04X (%d)\n",
                   pData[0] | (pData[1] << 8),
                   pData[2] | (pData[3] << 8), pData[2] | (pData[3] << 8),
@@ -333,41 +333,33 @@ void treadmillDataCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
   newRecord.distance = 0;
   newRecord.time = 0;
   
-  // Парсинг скорости - всегда в байтах 2-3
+  // Парсинг скорости
   if (length >= 4) {
     uint16_t speedRaw = pData[2] | (pData[3] << 8);
-    newRecord.speed = speedRaw / 100.0;  // Конвертируем в км/ч
-    
-    Serial0.printf("SPEED: Raw=0x%04X (%d) -> %.1f km/h\n", 
-                  speedRaw, speedRaw, newRecord.speed);
+    newRecord.speed = speedRaw / 100.0;
   }
   
-  // Парсинг дистанции из байтов 4-6 (если есть)
+  // Парсинг дистанции
   uint32_t packetDistance = 0;
   if (length >= 7) {
     uint32_t distanceRaw = pData[4] | (pData[5] << 8) | (pData[6] << 16);
     packetDistance = distanceRaw;
-    
-    Serial0.printf("PACKET DISTANCE: Raw=0x%06X (%d) meters\n", 
-                  distanceRaw, distanceRaw);
   }
   
-  // Парсинг времени из байтов 16-17
+  // Парсинг времени
   if (length >= 18) {
     uint16_t timeRaw = pData[16] | (pData[17] << 8);
     newRecord.time = timeRaw;
-    
-    Serial0.printf("TIME: Raw=0x%04X (%d) seconds\n", 
-                  timeRaw, timeRaw);
   }
   
   // Вычисление общей дистанции на основе скорости и времени
   if (newRecord.speed > 0.1 && lastTimeUpdate > 0) {
     unsigned long timeInterval = millis() - lastTimeUpdate;
-    if (timeInterval > 100 && timeInterval < 10000) { // От 0.1 до 10 секунд
-      float distanceInterval = (newRecord.speed / 3.6) * (timeInterval / 1000.0); // м/с * секунды
+    if (timeInterval > 100 && timeInterval < 10000) {
+      float distanceInterval = (newRecord.speed / 3.6) * (timeInterval / 1000.0);
       totalDistance += distanceInterval;
       
+      // Выводим расчеты только когда есть движение
       Serial0.printf("CALCULATED: Interval=%.1fs, Distance+=%.2fm, Total=%.1fm\n",
                     timeInterval / 1000.0, distanceInterval, totalDistance);
     }
@@ -377,34 +369,34 @@ void treadmillDataCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
     lastTimeUpdate = millis();
   }
   
-  // Используем вычисленную общую дистанцию
   newRecord.distance = (uint32_t)totalDistance;
   
-  // Проверка валидности данных
   if (newRecord.speed > 25.0) {
     newRecord.speed = 0.0;
   }
   
   newRecord.isActive = (newRecord.speed > 0.1 && newRecord.time > 0);
   
-  Serial0.printf("FINAL: Speed=%.1f km/h, Calculated Distance=%d m, Time=%d s, Active=%s\n",
-                newRecord.speed, newRecord.distance, newRecord.time, 
-                newRecord.isActive ? "YES" : "NO");
-  
   updateWorkoutState(newRecord);
   addToBuffer(newRecord);
   
+  // Выводим основную информацию только при изменениях или активности
   static WorkoutRecord lastDisplayed = {0};
-  if (newRecord.speed != lastDisplayed.speed || 
-      newRecord.distance != lastDisplayed.distance ||
+  static bool wasActive = false;
+  bool isActive = (newRecord.speed > 0.1);
+  
+  if ((isActive != wasActive) ||
+      (isActive && (newRecord.speed != lastDisplayed.speed ||
+                    newRecord.distance != lastDisplayed.distance)) ||
       currentState != previousState) {
     
     Serial0.printf("STATE: %s, Speed: %.1f km/h, Total Distance: %d m, Time: %d s\n",
-                  currentState == STANDBY ? "STANDBY" : 
+                  currentState == STANDBY ? "STANDBY" :
                   currentState == ACTIVE ? "ACTIVE" : "ENDED",
                   newRecord.speed, newRecord.distance, newRecord.time);
     
     lastDisplayed = newRecord;
+    wasActive = isActive;
   }
 }
 
