@@ -21,7 +21,7 @@ const int daylightOffset_sec = 0;
 
 // Настройки буфера (уменьшены для экономии памяти)
 const size_t MAX_BUFFER_SIZE = 200;
-const unsigned long STANDBY_TIMEOUT = 15000;
+const unsigned long STANDBY_TIMEOUT = 8000; // 8 секунд для более быстрого определения окончания
 const unsigned long CONNECTION_CHECK_INTERVAL = 5000;
 
 BLEAddress treadmillAddress(TREADMILL_MAC);
@@ -569,31 +569,76 @@ if (record.speed < 0.8) {
   if (isCurrentlyActive) {
     lastActiveTime = millis();
     if (currentState == STANDBY && (millis() - workoutEndTime_millis > WORKOUT_COOLDOWN)) {
-      currentState = ACTIVE;
+      // Требуем стабильную активность минимум 3 секунды перед началом записи
+      static unsigned long firstActiveDetection = 0;
+      static float stableSpeedSum = 0.0;
+      static int stableSpeedCount = 0;
       
-      time_t currentTime = time(nullptr);
-      
-      // ПРОВЕРЯЕМ ВАЛИДНОСТЬ ВРЕМЕНИ ПЕРЕД УСТАНОВКОЙ
-      if (isTimeValid(currentTime)) {
-        workoutStartTime = currentTime;
-        Serial0.printf(">>> WORKOUT STARTED at %s!\n",
-                       getReadableTime(workoutStartTime).c_str());
+      if (firstActiveDetection == 0) {
+        firstActiveDetection = millis();
+        stableSpeedSum = record.speed;
+        stableSpeedCount = 1;
       } else {
-        Serial0.printf(">>> WARNING: Invalid time detected (%ld), waiting for NTP sync...\n", currentTime);
-        currentState = STANDBY; // Возвращаемся в режим ожидания
-        return; // Выходим без начала тренировки
+        stableSpeedSum += record.speed;
+        stableSpeedCount++;
+        
+        // Проверяем стабильность активности в течение 3 секунд
+        if (millis() - firstActiveDetection >= 3000) {
+          float avgStableSpeed = stableSpeedSum / stableSpeedCount;
+          
+          if (avgStableSpeed >= 1.0) { // Средняя скорость должна быть минимум 1 км/ч
+            currentState = ACTIVE;
+            
+            time_t currentTime = time(nullptr);
+            
+            if (isTimeValid(currentTime)) {
+              workoutStartTime = currentTime;
+              Serial0.printf(">>> WORKOUT STARTED at %s! (Avg speed during detection: %.1f km/h)\n",
+                             getReadableTime(workoutStartTime).c_str(), avgStableSpeed);
+            } else {
+              Serial0.printf(">>> WARNING: Invalid time detected (%ld), waiting for NTP sync...\n", currentTime);
+              currentState = STANDBY;
+              firstActiveDetection = 0;
+              return;
+            }
+            
+            // Сбрасываем счетчики при начале новой тренировки
+            totalDistance = 0.0;
+            sessionStartTime = millis();
+            lastTimeUpdate = millis();
+          }
+          
+          // Сбрасываем детектор в любом случае
+          firstActiveDetection = 0;
+          stableSpeedSum = 0.0;
+          stableSpeedCount = 0;
+        }
       }
-      
-      // Сбрасываем счетчики при начале новой тренировки
-      totalDistance = 0.0;
-      sessionStartTime = millis();
-      lastTimeUpdate = millis();
+    } else {
+      // Сбрасываем детектор активности если движение прекратилось
+      static unsigned long firstActiveDetection = 0;
+      firstActiveDetection = 0;
     }
   } else {
     unsigned long inactiveTime = millis() - lastActiveTime;
     
-    if (currentState == ACTIVE && (inactiveTime > STANDBY_TIMEOUT ||
-                                  record.speed <= 0.1)) {
+    if (currentState == ACTIVE && inactiveTime > STANDBY_TIMEOUT) {
+      // Дополнительная проверка: если скорость ниже 0.5 км/ч более 10 секунд - завершаем
+      static unsigned long lowSpeedStartTime = 0;
+      
+      if (record.speed < 0.5) {
+        if (lowSpeedStartTime == 0) {
+          lowSpeedStartTime = millis();
+        } else if (millis() - lowSpeedStartTime > 10000) { // 10 секунд низкой скорости
+          Serial0.printf(">>> Ending workout due to prolonged low speed (%.1f km/h)\n", record.speed);
+          lowSpeedStartTime = 0; // Сброс для следующего раза
+        } else {
+          return; // Продолжаем ждать
+        }
+      } else {
+        lowSpeedStartTime = 0; // Сброс если скорость поднялась
+        return; // Не завершаем тренировку если скорость нормальная
+      }
       time_t currentTime = time(nullptr);
       
       // ПРОВЕРЯЕМ ВАЛИДНОСТЬ ВРЕМЕНИ ПЕРЕД ОКОНЧАНИЕМ
