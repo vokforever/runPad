@@ -58,6 +58,8 @@ time_t workoutStartTime = 0;
 time_t workoutEndTime = 0;
 unsigned long lastActiveTime = 0;
 unsigned long lastConnectionCheck = 0;
+unsigned long workoutEndTime_millis = 0;
+const unsigned long WORKOUT_COOLDOWN = 30000; // 30 секунд покоя после тренировки
 
 // Глобальные переменные для расчета дистанции
 float totalDistance = 0.0;
@@ -73,6 +75,14 @@ void sendWorkoutToSupabase();
 void updateWorkoutState(const WorkoutRecord& record);
 void addToBuffer(const WorkoutRecord& record);
 
+// Функция проверки валидности времени
+bool isTimeValid(time_t timeValue) {
+  // Время должно быть больше 1 января 2020 и меньше 1 января 2030
+  const time_t MIN_VALID_TIME = 1577836800; // 1 января 2020
+  const time_t MAX_VALID_TIME = 1893456000; // 1 января 2030
+  
+  return (timeValue >= MIN_VALID_TIME && timeValue <= MAX_VALID_TIME);
+}
 // Функция получения текущего времени в формате ISO 8601
 String getISOTimestamp(time_t timeValue) {
   struct tm timeinfo;
@@ -131,22 +141,61 @@ String createOptimizedWorkoutJson(const std::vector<WorkoutRecord>& buffer, time
 }
 
 void sendWorkoutToSupabaseFromTask(WorkoutData* data) {
-  if (data->buffer.empty() || WiFi.status() != WL_CONNECTED) {
-    Serial0.println("No workout data to send or no WiFi");
+  if (data->buffer.empty()) {
+    Serial0.println("No workout data to send");
+    return;
+  }
+
+  // ПРОВЕРЯЕМ ВАЛИДНОСТЬ ВРЕМЕННЫХ МЕТОК
+  if (!isTimeValid(data->startTime) || !isTimeValid(data->endTime)) {
+    Serial0.printf("Invalid timestamps - Start: %ld, End: %ld\n", data->startTime, data->endTime);
+    return;
+  }
+
+  // ПРОВЕРЯЕМ РАЗУМНОСТЬ ДЛИТЕЛЬНОСТИ
+  long duration = data->endTime - data->startTime;
+  if (duration <= 0 || duration > 86400) { // От 0 до 24 часов
+    Serial0.printf("Invalid workout duration: %ld seconds\n", duration);
     return;
   }
   
-  Serial0.printf("Sending workout: %s - %s\n", 
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial0.println("No WiFi connection - reconnecting...");
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+      delay(1000);
+      Serial0.print(".");
+      attempts++;
+    }
+    
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial0.println("\nFailed to reconnect WiFi");
+      return;
+    }
+    Serial0.println("\nWiFi reconnected");
+  }
+  
+  Serial0.printf("Sending workout: %s - %s (Duration: %ld sec)\n",
                 getReadableTime(data->startTime).c_str(),
-                getReadableTime(data->endTime).c_str());
+                getReadableTime(data->endTime).c_str(),
+                duration);
   
-  // Создаем HTTP клиент
+  // Создаем HTTP клиент с SSL настройками
   HTTPClient http;
-  
+
   // ИСПРАВЛЕНО: Полный URL с путем к таблице
-  String fullUrl = String(SUPABASE_URL) + "/rest/v1/workouts"; // Замените "workouts" на имя вашей таблицы
+  String fullUrl = String(SUPABASE_URL) + "/rest/v1/workouts";
   http.begin(fullUrl);
-  http.setTimeout(10000); // 10 секунд таймаут
+
+  // Увеличиваем таймауты для стабильности
+  http.setTimeout(15000); // 15 секунд таймаут
+  http.setConnectTimeout(8000); // 8 секунд на подключение
+
+  // Добавляем SSL настройки для стабильности
+  http.setReuse(false); // Отключаем переиспользование соединения
   
   // Все необходимые заголовки
   http.addHeader("Content-Type", "application/json");
@@ -156,31 +205,67 @@ void sendWorkoutToSupabaseFromTask(WorkoutData* data) {
   
   // Создаем JSON
   String jsonPayload = createOptimizedWorkoutJson(data->buffer, data->startTime, data->endTime);
-  
+
   Serial0.println("Sending to: " + fullUrl);
   Serial0.println("JSON size: " + String(jsonPayload.length()) + " bytes");
-  Serial0.println("JSON: " + jsonPayload);
-  
-  // Отправляем запрос
-  int httpResponse = http.POST(jsonPayload);
-  
-  // Получаем ответ
-  String response = "";
-  if (http.getSize() > 0 && http.getSize() < 1000) { // Ограничиваем размер ответа
-    response = http.getString();
-  }
-  
-  Serial0.printf("Supabase response code: %d\n", httpResponse);
-  
-  if (httpResponse == 200 || httpResponse == 201) {
-    Serial0.println("✓ Workout sent successfully!");
-  } else {
-    Serial0.printf("✗ Failed to send workout. Code: %d\n", httpResponse);
-    if (response.length() > 0 && response.length() < 200) {
-      Serial0.println("Error details: " + response);
+
+  int httpResponse = -1;
+  int attempts = 0;
+  const int maxAttempts = 3;
+
+  // Повторные попытки отправки
+  while (httpResponse <= 0 && attempts < maxAttempts) {
+    attempts++;
+    Serial0.printf("Attempt %d/%d...\n", attempts, maxAttempts);
+    
+    // Проверяем память перед каждой попыткой
+    Serial0.printf("Free heap before attempt: %d bytes\n", ESP.getFreeHeap());
+    
+    httpResponse = http.POST(jsonPayload);
+    
+    if (httpResponse <= 0) {
+      Serial0.printf("HTTP error on attempt %d: %d\n", attempts, httpResponse);
+      if (attempts < maxAttempts) {
+        delay(2000 * attempts); // Увеличиваем задержку с каждой попыткой
+      }
     }
   }
   
+  // Получаем ответ
+  String response = "";
+  if (httpResponse > 0) {
+    if (http.getSize() > 0 && http.getSize() < 1000) {
+      response = http.getString();
+    }
+    Serial0.printf("Supabase response code: %d\n", httpResponse);
+    
+    if (httpResponse == 200 || httpResponse == 201) {
+      Serial0.println("✓ Workout sent successfully!");
+    } else {
+      Serial0.printf("✗ HTTP error. Code: %d\n", httpResponse);
+      if (response.length() > 0 && response.length() < 200) {
+        Serial0.println("Response: " + response);
+      }
+    }
+  } else {
+    Serial0.printf("✗ Connection failed. Error code: %d\n", httpResponse);
+    
+    // Расшифровка основных SSL ошибок
+    switch (httpResponse) {
+      case -1:
+        Serial0.println("Error: Connection failed or timeout");
+        break;
+      case -11:
+        Serial0.println("Error: Connection refused");
+        break;
+      case -29312:
+        Serial0.println("Error: SSL connection ended unexpectedly (EOF)");
+        break;
+      default:
+        Serial0.printf("Error: Unknown connection error (%d)\n", httpResponse);
+    }
+  }
+
   http.end();
 }
 
@@ -218,11 +303,15 @@ void sendWorkoutToSupabase() {
     return;
   }
   
-  // Проверяем свободную память
-  if (ESP.getFreeHeap() < 10000) {
-    Serial0.println("Low memory - skipping workout send");
+  // Проверяем свободную память более строго
+  const int MIN_MEMORY_FOR_HTTP = 15000; // Увеличено для SSL
+  if (ESP.getFreeHeap() < MIN_MEMORY_FOR_HTTP) {
+    Serial0.printf("Low memory for HTTP - skipping. Free: %d, Required: %d\n",
+                  ESP.getFreeHeap(), MIN_MEMORY_FOR_HTTP);
     return;
   }
+
+  Serial0.printf("Memory check OK: %d bytes free\n", ESP.getFreeHeap());
   
   Serial0.println(">>> PREPARING TO SEND TO SUPABASE!");
   
@@ -246,30 +335,67 @@ void updateWorkoutState(const WorkoutRecord& record) {
   previousState = currentState;
   
   bool isCurrentlyActive = (record.speed > 0.1 && record.time > 0);
+
+// Игнорируем очень низкие скорости как шум
+if (record.speed < 0.5) {
+  isCurrentlyActive = false;
+}
   
   if (isCurrentlyActive) {
     lastActiveTime = millis();
-    if (currentState == STANDBY) {
+    if (currentState == STANDBY && (millis() - workoutEndTime_millis > WORKOUT_COOLDOWN)) {
       currentState = ACTIVE;
-      workoutStartTime = time(nullptr);
+      
+      time_t currentTime = time(nullptr);
+      
+      // ПРОВЕРЯЕМ ВАЛИДНОСТЬ ВРЕМЕНИ ПЕРЕД УСТАНОВКОЙ
+      if (isTimeValid(currentTime)) {
+        workoutStartTime = currentTime;
+        Serial0.printf(">>> WORKOUT STARTED at %s!\n",
+                       getReadableTime(workoutStartTime).c_str());
+      } else {
+        Serial0.printf(">>> WARNING: Invalid time detected (%ld), waiting for NTP sync...\n", currentTime);
+        currentState = STANDBY; // Возвращаемся в режим ожидания
+        return; // Выходим без начала тренировки
+      }
       
       // Сбрасываем счетчики при начале новой тренировки
       totalDistance = 0.0;
       sessionStartTime = millis();
       lastTimeUpdate = millis();
-      
-      Serial0.printf(">>> WORKOUT STARTED at %s!\n", 
-                     getReadableTime(workoutStartTime).c_str());
     }
   } else {
     unsigned long inactiveTime = millis() - lastActiveTime;
     
-    if (currentState == ACTIVE && (inactiveTime > STANDBY_TIMEOUT || 
+    if (currentState == ACTIVE && (inactiveTime > STANDBY_TIMEOUT ||
                                   record.speed <= 0.1)) {
-      currentState = WORKOUT_ENDED;
-      workoutEndTime = time(nullptr);
-      Serial0.printf(">>> WORKOUT ENDED at %s!\n", 
-                     getReadableTime(workoutEndTime).c_str());
+      time_t currentTime = time(nullptr);
+      
+      // ПРОВЕРЯЕМ ВАЛИДНОСТЬ ВРЕМЕНИ ПЕРЕД ОКОНЧАНИЕМ
+      if (isTimeValid(currentTime) && isTimeValid(workoutStartTime)) {
+        workoutEndTime = currentTime;
+        
+        // ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: длительность не должна быть больше 24 часов
+        long duration = workoutEndTime - workoutStartTime;
+        if (duration > 86400) { // 24 часа в секундах
+          Serial0.printf(">>> WARNING: Invalid workout duration (%ld sec), skipping save\n", duration);
+          currentState = STANDBY;
+          workoutBuffer.clear();
+          totalDistance = 0.0;
+          return;
+        }
+        
+        currentState = WORKOUT_ENDED;
+        workoutEndTime_millis = millis(); // Сохраняем время окончания в миллисекундах
+        Serial0.printf(">>> WORKOUT ENDED at %s! Duration: %ld seconds\n",
+                       getReadableTime(workoutEndTime).c_str(), duration);
+      } else {
+        Serial0.printf(">>> WARNING: Invalid time for workout end, discarding workout\n");
+        currentState = STANDBY;
+        workoutBuffer.clear();
+        totalDistance = 0.0;
+        return;
+      }
     }
   }
   
@@ -282,7 +408,13 @@ void updateWorkoutState(const WorkoutRecord& record) {
 void addToBuffer(const WorkoutRecord& record) {
   static WorkoutRecord lastRecord = {0};
   
-  bool shouldAdd = (record.distance != lastRecord.distance || 
+  // ПРОВЕРЯЕМ ВАЛИДНОСТЬ ВРЕМЕНИ В ЗАПИСИ
+  if (!isTimeValid(record.timestamp)) {
+    Serial0.printf("Skipping record with invalid timestamp: %ld\n", record.timestamp);
+    return;
+  }
+  
+  bool shouldAdd = (record.distance != lastRecord.distance ||
                    record.speed != lastRecord.speed ||
                    record.time != lastRecord.time);
   
@@ -337,6 +469,11 @@ void treadmillDataCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
   if (length >= 4) {
     uint16_t speedRaw = pData[2] | (pData[3] << 8);
     newRecord.speed = speedRaw / 100.0;
+    
+    // Фильтр шума - скорости менее 0.3 км/ч считаем нулевыми
+    if (newRecord.speed < 0.3) {
+      newRecord.speed = 0.0;
+    }
   }
   
   // Парсинг дистанции
@@ -404,7 +541,8 @@ void setup() {
   Serial0.begin(115200);
   delay(3000);
   
-  Serial0.println("ESP32-S3 Treadmill Logger v2.4 - Stack Safe");
+  Serial0.println("ESP32-S3 Treadmill Logger v2.5 - Anti-Multiple Sessions");
+  workoutEndTime_millis = millis(); // Инициализируем время окончания
   Serial0.printf("Free heap at start: %d bytes\n", ESP.getFreeHeap());
   
   // СОЗДАЕМ HTTP ЗАДАЧУ И ОЧЕРЕДЬ ПЕРВЫМИ
@@ -419,7 +557,7 @@ void setup() {
   BaseType_t result = xTaskCreatePinnedToCore(
     httpTask,           // Функция задачи
     "HTTP_Task",        // Имя задачи
-    12288,              // Размер стека (12KB) - увеличен для HTTP
+    16384,              // Размер стека (16KB) - увеличено для SSL
     nullptr,            // Параметр
     2,                  // Приоритет (выше чем у loop)
     &httpTaskHandle,    // Хендл задачи
@@ -444,13 +582,33 @@ void setup() {
   // Настройка NTP для получения точного времени
   Serial0.println("Getting time from NTP...");
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  
+
+  // ЖДЕМ СИНХРОНИЗАЦИИ ВРЕМЕНИ
+  int ntpAttempts = 0;
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    Serial0.println("Failed to obtain time");
-  } else {
-    Serial0.printf("Current time: %s\n", getReadableTime(time(nullptr)).c_str());
+  while (!getLocalTime(&timeinfo) && ntpAttempts < 20) {
+    delay(1000);
+    Serial0.print(".");
+    ntpAttempts++;
   }
+
+  if (ntpAttempts >= 20) {
+    Serial0.println("\nFailed to obtain time from NTP");
+  } else {
+    time_t currentTime = time(nullptr);
+    Serial0.printf("\nCurrent time: %s (timestamp: %ld)\n",
+                  getReadableTime(currentTime).c_str(), currentTime);
+    
+    // Проверяем валидность полученного времени
+    if (!isTimeValid(currentTime)) {
+      Serial0.println("WARNING: Received invalid time from NTP!");
+    }
+  }
+
+  // ИНИЦИАЛИЗИРУЕМ ВРЕМЕННЫЕ ПЕРЕМЕННЫЕ НУЛЕВЫМИ ЗНАЧЕНИЯМИ
+  workoutStartTime = 0;
+  workoutEndTime = 0;
+  workoutEndTime_millis = millis();
   
   Serial0.println("Connecting to treadmill...");
   BLEDevice::init("");
@@ -481,9 +639,34 @@ void loop() {
     if (millis() - lastConnectionCheck > CONNECTION_CHECK_INTERVAL) {
       lastConnectionCheck = millis();
       
+      // ПРОВЕРЯЕМ АКТУАЛЬНОСТЬ СИСТЕМНОГО ВРЕМЕНИ
+      time_t currentTime = time(nullptr);
+      if (!isTimeValid(currentTime)) {
+        Serial0.printf("WARNING: System time is invalid: %ld\n", currentTime);
+        
+        // Пытаемся пересинхронизировать время
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+      }
+      
       // Проверяем память
       if (ESP.getFreeHeap() < 8000) {
         Serial0.printf("WARNING: Low memory! Free heap: %d bytes\n", ESP.getFreeHeap());
+      }
+
+      // Проверяем качество WiFi соединения
+      int rssi = WiFi.RSSI();
+      if (rssi < -80) {
+        Serial0.printf("Weak WiFi signal: %d dBm\n", rssi);
+      }
+
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial0.println("WiFi disconnected - attempting reconnection");
+        WiFi.reconnect();
+      }
+      
+      if (currentState == STANDBY && (millis() - workoutEndTime_millis < WORKOUT_COOLDOWN)) {
+        unsigned long remaining = (WORKOUT_COOLDOWN - (millis() - workoutEndTime_millis)) / 1000;
+        Serial0.printf("COOLDOWN: %lu seconds remaining\n", remaining);
       }
       
       // Если долго в активном состоянии без данных - сбрасываем
