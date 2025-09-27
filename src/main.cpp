@@ -39,7 +39,7 @@ const int daylightOffset_sec = 0;
 
 // Настройки буфера
 const size_t MAX_BUFFER_SIZE = 200;
-const unsigned long STANDBY_TIMEOUT = 30000;
+const unsigned long STANDBY_TIMEOUT = 10000;
 const unsigned long CONNECTION_CHECK_INTERVAL = 5000;
 
 // Пороги активности
@@ -470,7 +470,7 @@ void sendWorkoutToSupabaseFromTask(WorkoutData* data) {
     if (httpResponse == 200 || httpResponse == 201) {
       Serial0.println("✓ Workout sent successfully!");
       setLEDState(LED_SUCCESS);
-      delay(3000);
+      delay(1000);
       setLEDState(LED_STANDBY);
     } else {
       Serial0.printf("✗ HTTP error. Code: %d\n", httpResponse);
@@ -498,7 +498,7 @@ void sendWorkoutToSupabaseFromTask(WorkoutData* data) {
         Serial0.println("403 Forbidden - Check RLS policies for INSERT operation");
       }
       
-      delay(5000);
+      delay(2000);
       setLEDState(LED_STANDBY);
     }
   } else {
@@ -529,7 +529,7 @@ void sendWorkoutToSupabaseFromTask(WorkoutData* data) {
         Serial0.printf("Error: Network error code %d\n", httpResponse);
     }
     
-    delay(5000);
+    delay(2000);
     setLEDState(LED_STANDBY);
   }
 
@@ -678,8 +678,7 @@ void updateWorkoutState(const WorkoutRecord& record) {
     sendWorkoutToSupabase();
     Serial0.println(">>> sendWorkoutToSupabase() completed");
     currentState = STANDBY;
-    setLEDState(LED_STANDBY);
-    Serial0.println(">>> State changed to STANDBY, LED set to STANDBY");
+    Serial0.println(">>> State changed to STANDBY");
   }
 }
 
