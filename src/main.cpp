@@ -10,10 +10,6 @@
 #include <vector>
 #include "config.h"
 
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
-#include <ArduinoJson.h>
-
 // NTP сервера
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3 * 3600;     // МСК = UTC+3
@@ -70,16 +66,6 @@ float totalDistance = 0.0;
 unsigned long lastTimeUpdate = 0;
 unsigned long sessionStartTime = 0;
 
-// Веб-сервер
-AsyncWebServer webServer(80);
-String dailyStatsJson = "{}";
-bool webServerEnabled = false;
-
-// Конфиг для расчета калорий (спрятан)
-const int USER_HEIGHT = 193; // см
-const int USER_WEIGHT = 110;  // кг
-const bool USER_MALE = true;
-
 // FORWARD DECLARATIONS
 void sendWorkoutToSupabaseFromTask(WorkoutData* data);
 String createOptimizedWorkoutJson(const std::vector<WorkoutRecord>& buffer, time_t startTime, time_t endTime);
@@ -87,6 +73,8 @@ String getISOTimestamp(time_t timeValue);
 String getReadableTime(time_t timeValue);
 void sendWorkoutToSupabase();
 void updateWorkoutState(const WorkoutRecord& record);
+void addToBuffer(const WorkoutRecord& record);
+
 // Функция проверки валидности времени
 bool isTimeValid(time_t timeValue) {
   // Время должно быть больше 1 января 2020 и меньше 1 января 2030
@@ -95,219 +83,6 @@ bool isTimeValid(time_t timeValue) {
   
   return (timeValue >= MIN_VALID_TIME && timeValue <= MAX_VALID_TIME);
 }
-// Расчет калорий на основе MET значений
-float calculateCalories(float avgSpeed, int durationSeconds) {
-  if (durationSeconds <= 0) return 0.0;
-  
-  float hours = durationSeconds / 3600.0;
-  float met = 1.0; // базовое значение покоя
-  
-  // MET значения для разных скоростей (км/ч)
-  if (avgSpeed < 1.0) {
-    met = 1.0; // покой
-  } else if (avgSpeed < 4.0) {
-    met = 3.5; // медленная ходьба
-  } else if (avgSpeed < 6.0) {
-    met = 4.5; // обычная ходьба
-  } else if (avgSpeed < 8.0) {
-    met = 6.0; // быстрая ходьба
-  } else if (avgSpeed < 10.0) {
-    met = 8.0; // легкий бег
-  } else if (avgSpeed < 12.0) {
-    met = 10.0; // умеренный бег
-  } else {
-    met = 11.5; // быстрый бег
-  }
-  
-  // Формула: Калории = MET × вес(кг) × время(часы)
-  float calories = met * USER_WEIGHT * hours;
-  
-  return calories;
-}
-
-// Получение дневной статистики из Supabase
-void fetchDailyStats() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial0.println("No WiFi for stats fetch");
-    return;
-  }
-  
-  // Получаем текущую дату для фильтрации
-  time_t now = time(nullptr);
-  if (!isTimeValid(now)) {
-    Serial0.println("Invalid time for stats fetch");
-    return;
-  }
-  
-  struct tm timeinfo;
-  localtime_r(&now, &timeinfo);
-  
-  char dateStr[11];
-  strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", &timeinfo);
-  
-  HTTPClient http;
-  String url = String(SUPABASE_URL) + "/rest/v1/workouts?workout_start=gte." + String(dateStr) + "T00:00:00&workout_start=lt." + String(dateStr) + "T23:59:59";
-  
-  http.begin(url);
-  http.setTimeout(10000);
-  http.addHeader("apikey", SUPABASE_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
-  
-  int httpCode = http.GET();
-  
-  if (httpCode == 200) {
-    String response = http.getString();
-    http.end();
-    
-    // Парсинг JSON ответа
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, response);
-    
-    if (error) {
-      Serial0.println("JSON parsing failed");
-      return;
-    }
-    
-    float totalMinutes = 0;
-    float totalDistance = 0;
-    float totalCalories = 0;
-    int totalWorkouts = doc.size();
-    
-    for (JsonVariant workout : doc.as<JsonArray>()) {
-      int duration = workout["duration_seconds"] | 0;
-      int distance = workout["total_distance"] | 0;
-      float avgSpeed = workout["avg_speed"] | 0.0;
-      
-      totalMinutes += duration / 60.0;
-      totalDistance += distance / 1000.0; // в км
-      totalCalories += calculateCalories(avgSpeed, duration);
-    }
-    
-    // Формируем JSON для веб-интерфейса
-    JsonDocument statsDoc;
-    statsDoc["totalMinutes"] = round(totalMinutes);
-    statsDoc["totalDistance"] = round(totalDistance * 10) / 10.0;
-    statsDoc["totalCalories"] = round(totalCalories);
-    statsDoc["totalWorkouts"] = totalWorkouts;
-    statsDoc["date"] = String(dateStr);
-    
-    serializeJson(statsDoc, dailyStatsJson);
-    Serial0.println("Daily stats updated: " + dailyStatsJson);
-    
-  } else {
-    Serial0.printf("Failed to fetch stats: %d\n", httpCode);
-    http.end();
-  }
-}
-
-// HTML страница для веб-интерфейса
-const char* getWebPageHTML() {
-  static String html = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Статистика тренировок</title>
-    <style>
-        body { font-family: Arial; margin: 0; padding: 20px; background: #f0f0f0; }
-        .container { max-width: 800px; margin: 0 auto; background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { text-align: center; color: #333; margin-bottom: 30px; }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 20px; margin-bottom: 30px; }
-        .stat-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 10px; text-align: center; }
-        .stat-value { font-size: 2.5em; font-weight: bold; margin-bottom: 5px; }
-        .stat-label { font-size: 0.9em; opacity: 0.9; }
-        .refresh-btn { background: #4CAF50; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 16px; }
-        .refresh-btn:hover { background: #45a049; }
-        .date-info { text-align: center; color: #666; margin-bottom: 20px; }
-        .loading { text-align: center; color: #666; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>📊 Дневная статистика</h1>
-        <div class="date-info" id="dateInfo">Загрузка...</div>
-        
-        <div class="stats-grid" id="statsGrid">
-            <div class="loading">Загрузка данных...</div>
-        </div>
-        
-        <div style="text-align: center;">
-            <button class="refresh-btn" onclick="loadStats()">🔄 Обновить</button>
-        </div>
-    </div>
-
-    <script>
-        function loadStats() {
-            document.getElementById('statsGrid').innerHTML = '<div class="loading">Загрузка данных...</div>';
-            
-            fetch('/api/daily-stats')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('dateInfo').innerHTML = `Данные за ${data.date || 'сегодня'}`;
-                    
-                    const statsHtml = `
-                        <div class="stat-card">
-                            <div class="stat-value">${data.totalMinutes || 0}</div>
-                            <div class="stat-label">Минут тренировок</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">${data.totalDistance || 0}</div>
-                            <div class="stat-label">Км пройдено</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">${data.totalCalories || 0}</div>
-                            <div class="stat-label">Калорий сожжено</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">${data.totalWorkouts || 0}</div>
-                            <div class="stat-label">Тренировок</div>
-                        </div>
-                    `;
-                    
-                    document.getElementById('statsGrid').innerHTML = statsHtml;
-                })
-                .catch(error => {
-                    console.error('Error:', error);
-                    document.getElementById('statsGrid').innerHTML = '<div class="loading">Ошибка загрузки данных</div>';
-                });
-        }
-        
-        loadStats();
-        setInterval(loadStats, 30000);
-    </script>
-</body>
-</html>
-)rawliteral";
-  
-  return html.c_str();
-}
-
-// Инициализация веб-сервера
-void initWebServer() {
-  // Главная страница
-  webServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send(200, "text/html", getWebPageHTML());
-  });
-  
-  // API эндпоинт для получения статистики
-  webServer.on("/api/daily-stats", HTTP_GET, [](AsyncWebServerRequest *request){
-    fetchDailyStats(); // Обновляем данные
-    request->send(200, "application/json", dailyStatsJson);
-  });
-  
-  // Обработка 404
-  webServer.onNotFound([](AsyncWebServerRequest *request){
-    request->send(404, "text/plain", "Not found");
-  });
-  
-  webServer.begin();
-  webServerEnabled = true;
-  Serial0.println("Web server started on http://" + WiFi.localIP().toString());
-}
-
-
- 
 // Функция получения текущего времени в формате ISO 8601
 String getISOTimestamp(time_t timeValue) {
   struct tm timeinfo;
@@ -561,8 +336,8 @@ void updateWorkoutState(const WorkoutRecord& record) {
   
   bool isCurrentlyActive = (record.speed > 0.1 && record.time > 0);
 
-// Игнорируем только очень низкие скорости как шум (менее 0.8 км/ч)
-if (record.speed < 0.8) {
+// Игнорируем очень низкие скорости как шум
+if (record.speed < 0.5) {
   isCurrentlyActive = false;
 }
   
@@ -740,8 +515,8 @@ void treadmillDataCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
     uint16_t speedRaw = pData[2] | (pData[3] << 8);
     newRecord.speed = speedRaw / 100.0;
     
-    // Фильтр шума - только очень низкие скорости считаем нулевыми
-    if (newRecord.speed < 0.2) {
+    // Фильтр шума - скорости менее 0.3 км/ч считаем нулевыми
+    if (newRecord.speed < 0.3) {
       newRecord.speed = 0.0;
     }
   }
@@ -760,7 +535,7 @@ void treadmillDataCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
   }
   
   // Вычисление общей дистанции на основе скорости и времени
-  if (newRecord.speed >= 0.8 && lastTimeUpdate > 0) {
+  if (newRecord.speed > 0.1 && lastTimeUpdate > 0) {
     unsigned long timeInterval = millis() - lastTimeUpdate;
     if (timeInterval > 100 && timeInterval < 10000) {
       float distanceInterval = (newRecord.speed / 3.6) * (timeInterval / 1000.0);
@@ -772,7 +547,7 @@ void treadmillDataCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
     }
   }
   
-  if (newRecord.speed >= 0.8) {
+  if (newRecord.speed > 0.1) {
     lastTimeUpdate = millis();
   }
   
@@ -782,7 +557,7 @@ void treadmillDataCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
     newRecord.speed = 0.0;
   }
   
-  newRecord.isActive = (newRecord.speed >= 0.8 && newRecord.time > 0);
+  newRecord.isActive = (newRecord.speed > 0.1 && newRecord.time > 0);
   
   updateWorkoutState(newRecord);
   addToBuffer(newRecord);
@@ -790,7 +565,7 @@ void treadmillDataCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
   // Выводим основную информацию только при изменениях или активности
   static WorkoutRecord lastDisplayed = {0};
   static bool wasActive = false;
-  bool isActive = (newRecord.speed >= 0.8);
+  bool isActive = (newRecord.speed > 0.1);
   
   if ((isActive != wasActive) ||
       (isActive && (newRecord.speed != lastDisplayed.speed ||
@@ -899,13 +674,6 @@ void setup() {
   }
   
   Serial0.printf("Setup complete. Free heap: %d bytes\n", ESP.getFreeHeap());
-  
-  // Запускаем веб-сервер если достаточно памяти
-  if (ESP.getFreeHeap() > 25000) {
-    initWebServer();
-  } else {
-    Serial0.println("Not enough memory for web server");
-  }
 }
 
 void loop() {
@@ -939,13 +707,6 @@ void loop() {
       if (WiFi.status() != WL_CONNECTED) {
         Serial0.println("WiFi disconnected - attempting reconnection");
         WiFi.reconnect();
-      }
-      
-      // Обновляем веб-статистику каждые 5 минут
-      static unsigned long lastStatsUpdate = 0;
-      if (webServerEnabled && (millis() - lastStatsUpdate > 300000)) {
-        fetchDailyStats();
-        lastStatsUpdate = millis();
       }
       
       if (currentState == STANDBY && (millis() - workoutEndTime_millis < WORKOUT_COOLDOWN)) {
