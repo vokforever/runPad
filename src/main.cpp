@@ -8,20 +8,47 @@
 #include <HTTPClient.h>
 #include <time.h>
 #include <vector>
+#include <Adafruit_NeoPixel.h>
 #include "config.h"
+
+bool RAW = false;
+
+// Variables for workout start delay
+unsigned long workoutStartDelay = 5000; // 5 секунд задержка после старта
+unsigned long actualWorkoutStartTime = 0;
+
+// NeoPixel настройки
+#define NEOPIXEL_PIN 48     // GPIO48 для ESP32-S3
+#define NEOPIXEL_COUNT 1    // Количество светодиодов
+Adafruit_NeoPixel pixels(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+
+// NeoPixel цвета для состояний
+#define COLOR_OFF         pixels.Color(0, 0, 0)
+#define COLOR_STANDBY     pixels.Color(0, 0, 50)      // Синий - ожидание
+#define COLOR_ACTIVE      pixels.Color(0, 255, 0)     // Зелёный - активная тренировка
+#define COLOR_SENDING     pixels.Color(255, 165, 0)   // Оранжевый - отправка данных
+#define COLOR_SUCCESS     pixels.Color(0, 255, 255)   // Голубой - успешная отправка
+#define COLOR_ERROR       pixels.Color(255, 0, 0)     // Красный - ошибка
+#define COLOR_CONNECTING  pixels.Color(128, 0, 128)   // Фиолетовый - подключение
+#define COLOR_WIFI_ERROR  pixels.Color(255, 255, 0)   // Жёлтый - проблемы с WiFi
 
 // NTP сервера
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3 * 3600;     // МСК = UTC+3
 const int daylightOffset_sec = 0;
 
-// Настройки буфера (уменьшены для экономии памяти)
+// Настройки буфера
 const size_t MAX_BUFFER_SIZE = 200;
-const unsigned long STANDBY_TIMEOUT = 8000; // 8 секунд для более быстрого определения окончания
+const unsigned long STANDBY_TIMEOUT = 30000;
 const unsigned long CONNECTION_CHECK_INTERVAL = 5000;
+
+// Пороги активности
+const float MIN_ACTIVITY_SPEED = 0.8;    // 0.8 км/ч для расчета дистанции
+const float MIN_WORKOUT_SPEED = 0.5;     // 0.5 км/ч для начала тренировки
 
 BLEAddress treadmillAddress(TREADMILL_MAC);
 bool connected = false;
+bool wifiConnected = false;
 
 BLEClient* pClient = nullptr;
 BLERemoteCharacteristic* pTreadmillData = nullptr;
@@ -38,6 +65,21 @@ enum WorkoutState {
 
 WorkoutState currentState = STANDBY;
 WorkoutState previousState = STANDBY;
+
+enum LEDState {
+  LED_STANDBY,
+  LED_ACTIVE,
+  LED_SENDING,
+  LED_SUCCESS,
+  LED_ERROR,
+  LED_CONNECTING,
+  LED_WIFI_ERROR,
+  LED_BLINK
+};
+
+LEDState currentLEDState = LED_STANDBY;
+unsigned long lastLEDUpdate = 0;
+bool blinkState = false;
 
 struct WorkoutRecord {
   time_t timestamp;
@@ -59,12 +101,17 @@ time_t workoutEndTime = 0;
 unsigned long lastActiveTime = 0;
 unsigned long lastConnectionCheck = 0;
 unsigned long workoutEndTime_millis = 0;
-const unsigned long WORKOUT_COOLDOWN = 30000; // 30 секунд покоя после тренировки
+const unsigned long WORKOUT_COOLDOWN = 10000;
 
 // Глобальные переменные для расчета дистанции
 float totalDistance = 0.0;
 unsigned long lastTimeUpdate = 0;
 unsigned long sessionStartTime = 0;
+
+// Конфиг для расчета калорий
+const int USER_HEIGHT = 193;
+const int USER_WEIGHT = 110;
+const bool USER_MALE = true;
 
 // FORWARD DECLARATIONS
 void sendWorkoutToSupabaseFromTask(WorkoutData* data);
@@ -73,17 +120,201 @@ String getISOTimestamp(time_t timeValue);
 String getReadableTime(time_t timeValue);
 void sendWorkoutToSupabase();
 void updateWorkoutState(const WorkoutRecord& record);
-void addToBuffer(const WorkoutRecord& record);
+void updateNeoPixel();
+void setLEDState(LEDState newState);
+
+// Функция управления NeoPixel
+void updateNeoPixel() {
+  unsigned long currentTime = millis();
+  
+  // Обновляем мигание каждые 500мс
+  if (currentTime - lastLEDUpdate > 500) {
+    blinkState = !blinkState;
+    lastLEDUpdate = currentTime;
+  }
+  
+  uint32_t color = COLOR_OFF;
+  
+  switch (currentLEDState) {
+    case LED_STANDBY:
+      color = COLOR_STANDBY;
+      break;
+      
+    case LED_ACTIVE:
+      color = COLOR_ACTIVE;
+      break;
+      
+    case LED_SENDING:
+      color = COLOR_SENDING;
+      break;
+      
+    case LED_SUCCESS:
+      color = COLOR_SUCCESS;
+      break;
+      
+    case LED_ERROR:
+      color = COLOR_ERROR;
+      break;
+      
+    case LED_WIFI_ERROR:
+      color = COLOR_WIFI_ERROR;
+      break;
+      
+    case LED_CONNECTING:
+      color = blinkState ? COLOR_CONNECTING : COLOR_OFF;
+      break;
+      
+    case LED_BLINK:
+      color = blinkState ? COLOR_STANDBY : COLOR_OFF;
+      break;
+  }
+  
+  pixels.setPixelColor(0, color);
+  pixels.show();
+}
+
+// Установка состояния LED
+void setLEDState(LEDState newState) {
+  if (currentLEDState != newState) {
+    currentLEDState = newState;
+    Serial0.printf("LED State: %s\n", 
+      newState == LED_STANDBY ? "STANDBY" :
+      newState == LED_ACTIVE ? "ACTIVE" :
+      newState == LED_SENDING ? "SENDING" :
+      newState == LED_SUCCESS ? "SUCCESS" :
+      newState == LED_ERROR ? "ERROR" :
+      newState == LED_WIFI_ERROR ? "WIFI_ERROR" :
+      newState == LED_CONNECTING ? "CONNECTING" : "BLINK");
+  }
+}
 
 // Функция проверки валидности времени
 bool isTimeValid(time_t timeValue) {
-  // Время должно быть больше 1 января 2020 и меньше 1 января 2030
   const time_t MIN_VALID_TIME = 1577836800; // 1 января 2020
   const time_t MAX_VALID_TIME = 1893456000; // 1 января 2030
   
   return (timeValue >= MIN_VALID_TIME && timeValue <= MAX_VALID_TIME);
 }
-// Функция получения текущего времени в формате ISO 8601
+
+// Попытка переподключения WiFi
+void reconnectWiFi() {
+  Serial0.println("Attempting WiFi reconnection...");
+  setLEDState(LED_CONNECTING);
+  
+  WiFi.disconnect();
+  delay(1000);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 15) {
+    delay(1000);
+    Serial0.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial0.println("\nWiFi reconnected!");
+    wifiConnected = true;
+    setLEDState(LED_SUCCESS);
+    delay(1000);
+    
+    // Пересинхронизируем время после подключения WiFi
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  } else {
+    Serial0.println("\nWiFi reconnection failed");
+    wifiConnected = false;
+    setLEDState(LED_WIFI_ERROR);
+  }
+}
+
+// Тестирование подключения к Supabase с правильной структурой
+void testSupabaseConnection() {
+  if (!wifiConnected) {
+    Serial0.println("No WiFi for connection test");
+    setLEDState(LED_WIFI_ERROR);
+    return;
+  }
+  
+  Serial0.println("Testing Supabase connection...");
+  setLEDState(LED_CONNECTING);
+  
+  HTTPClient http;
+  // Тестируем структуру таблицы
+  String testUrl = String(SUPABASE_URL) + "/rest/v1/workouts?select=workout_start,workout_end,duration_seconds,total_distance,max_speed,avg_speed,records_count,device_name&limit=1";
+  
+  http.begin(testUrl);
+  http.setTimeout(10000);
+  
+http.addHeader("Content-Type", "application/json");
+http.addHeader("apikey", SUPABASE_KEY);
+http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+
+  
+  int responseCode = http.GET();
+  String response = "";
+  
+  if (responseCode > 0 && http.getSize() > 0 && http.getSize() < 1000) {
+    response = http.getString();
+  }
+  
+  Serial0.printf("Test response code: %d\n", responseCode);
+  
+  if (responseCode == 200) {
+    Serial0.println("✓ Supabase connection OK!");
+    Serial0.println("✓ Table structure accessible");
+    setLEDState(LED_SUCCESS);
+    delay(2000);
+    setLEDState(LED_STANDBY);
+  } else {
+    Serial0.printf("✗ Supabase connection failed: %d\n", responseCode);
+    setLEDState(LED_ERROR);
+    if (response.length() > 0 && response.length() < 200) {
+      Serial0.println("Error response: " + response);
+    }
+    
+    if (responseCode == 401) {
+      Serial0.println("401 Error: API key invalid or insufficient permissions");
+      Serial0.println("Make sure you're using service_role key for write operations");
+    } else if (responseCode == 404) {
+      Serial0.println("404 Error: Table 'workouts' not found or inaccessible");
+    }
+    
+    delay(3000);
+    setLEDState(LED_STANDBY);
+  }
+  
+  http.end();
+}
+
+// Расчет калорий на основе MET значений
+float calculateCalories(float avgSpeed, int durationSeconds) {
+  if (durationSeconds <= 0) return 0.0;
+  
+  float hours = durationSeconds / 3600.0;
+  float met = 1.0;
+  
+  // MET значения для разных скоростей (км/ч)
+  if (avgSpeed < 1.0) {
+    met = 2.0; // очень медленная ходьба
+  } else if (avgSpeed < 4.0) {
+    met = 3.5; // медленная ходьба
+  } else if (avgSpeed < 6.0) {
+    met = 4.5; // обычная ходьба
+  } else if (avgSpeed < 8.0) {
+    met = 6.0; // быстрая ходьба
+  } else if (avgSpeed < 10.0) {
+    met = 8.0; // легкий бег
+  } else if (avgSpeed < 12.0) {
+    met = 10.0; // умеренный бег
+  } else {
+    met = 11.5; // быстрый бег
+  }
+  
+  float calories = met * USER_WEIGHT * hours;
+  return calories;
+}
+
+// Функция получения времени в формате ISO 8601
 String getISOTimestamp(time_t timeValue) {
   struct tm timeinfo;
   localtime_r(&timeValue, &timeinfo);
@@ -103,7 +334,7 @@ String getReadableTime(time_t timeValue) {
   return String(buffer);
 }
 
-// Оптимизированная функция создания JSON (меньше использует память)
+// Создание JSON с правильной структурой таблицы workouts
 String createOptimizedWorkoutJson(const std::vector<WorkoutRecord>& buffer, time_t startTime, time_t endTime) {
   if (buffer.empty()) return "{}";
   
@@ -124,9 +355,9 @@ String createOptimizedWorkoutJson(const std::vector<WorkoutRecord>& buffer, time
   float avgSpeed = activeRecords > 0 ? totalSpeed / activeRecords : 0.0;
   long duration = endTime - startTime;
   
-  // Формируем JSON компактно - экономим память
+  // JSON с полной структурой как в таблице (без id и created_at - они автогенерируются)
   String json;
-  json.reserve(400); // Резервируем память заранее
+  json.reserve(400);
   
   json = "{\"workout_start\":\"" + getISOTimestamp(startTime) + 
          "\",\"workout_end\":\"" + getISOTimestamp(endTime) + 
@@ -135,7 +366,7 @@ String createOptimizedWorkoutJson(const std::vector<WorkoutRecord>& buffer, time
          ",\"max_speed\":" + String(maxSpeed, 1) + 
          ",\"avg_speed\":" + String(avgSpeed, 1) + 
          ",\"records_count\":" + String(buffer.size()) + 
-         ",\"device_name\":\"ESP32_Treadmill_Logger\"}";
+         ",\"device_name\":\"ESP32_S3_Treadmill_Logger\"}";
   
   return json;
 }
@@ -143,155 +374,194 @@ String createOptimizedWorkoutJson(const std::vector<WorkoutRecord>& buffer, time
 void sendWorkoutToSupabaseFromTask(WorkoutData* data) {
   if (data->buffer.empty()) {
     Serial0.println("No workout data to send");
+    setLEDState(LED_ERROR);
     return;
   }
 
-  // ПРОВЕРЯЕМ ВАЛИДНОСТЬ ВРЕМЕННЫХ МЕТОК
+  if (!wifiConnected) {
+    Serial0.println("No WiFi - attempting reconnection for workout upload");
+    reconnectWiFi();
+    if (!wifiConnected) {
+      Serial0.println("Still no WiFi - skipping workout upload");
+      setLEDState(LED_WIFI_ERROR);
+      return;
+    }
+  }
+
   if (!isTimeValid(data->startTime) || !isTimeValid(data->endTime)) {
     Serial0.printf("Invalid timestamps - Start: %ld, End: %ld\n", data->startTime, data->endTime);
+    setLEDState(LED_ERROR);
     return;
   }
 
-  // ПРОВЕРЯЕМ РАЗУМНОСТЬ ДЛИТЕЛЬНОСТИ
   long duration = data->endTime - data->startTime;
-  if (duration <= 0 || duration > 86400) { // От 0 до 24 часов
+  if (duration < 30 || duration > 86400) {
     Serial0.printf("Invalid workout duration: %ld seconds\n", duration);
+    setLEDState(LED_ERROR);
     return;
   }
   
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial0.println("No WiFi connection - reconnecting...");
-    WiFi.disconnect();
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
-      delay(1000);
-      Serial0.print(".");
-      attempts++;
-    }
-    
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial0.println("\nFailed to reconnect WiFi");
-      return;
-    }
-    Serial0.println("\nWiFi reconnected");
-  }
+  setLEDState(LED_SENDING);
   
   Serial0.printf("Sending workout: %s - %s (Duration: %ld sec)\n",
                 getReadableTime(data->startTime).c_str(),
                 getReadableTime(data->endTime).c_str(),
                 duration);
+  Serial0.printf("Buffer size: %d records\n", data->buffer.size());
   
-  // Создаем HTTP клиент с SSL настройками
   HTTPClient http;
-
-  // ИСПРАВЛЕНО: Полный URL с путем к таблице
   String fullUrl = String(SUPABASE_URL) + "/rest/v1/workouts";
   http.begin(fullUrl);
 
-  // Увеличиваем таймауты для стабильности
-  http.setTimeout(15000); // 15 секунд таймаут
-  http.setConnectTimeout(8000); // 8 секунд на подключение
-
-  // Добавляем SSL настройки для стабильности
-  http.setReuse(false); // Отключаем переиспользование соединения
+  http.setTimeout(10000);
+  http.setConnectTimeout(5000);
+  http.setReuse(false);
+  delay(10);
   
-  // Все необходимые заголовки
+  // Правильные заголовки для Supabase REST API
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("apikey", SUPABASE_KEY);  // apikey заголовок НУЖЕН
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
-  http.addHeader("Prefer", "return=minimal"); // Минимальный ответ для экономии памяти
+  http.addHeader("Prefer", "return=minimal");
   
-  // Создаем JSON
+  // Создаем JSON с правильной структурой
   String jsonPayload = createOptimizedWorkoutJson(data->buffer, data->startTime, data->endTime);
-
-  Serial0.println("Sending to: " + fullUrl);
-  Serial0.println("JSON size: " + String(jsonPayload.length()) + " bytes");
+  
+  Serial0.println("=== SUPABASE REQUEST DEBUG ===");
+  Serial0.println("URL: " + fullUrl);
+  Serial0.printf("Using API key: %.30s...\n", SUPABASE_KEY);
+  Serial0.printf("JSON size: %d bytes\n", jsonPayload.length());
+  Serial0.println("JSON payload: " + jsonPayload);
+  Serial0.println("Expected fields: workout_start, workout_end, duration_seconds, total_distance, max_speed, avg_speed, records_count, device_name");
+  Serial0.println("===============================");
 
   int httpResponse = -1;
   int attempts = 0;
   const int maxAttempts = 3;
 
-  // Повторные попытки отправки
   while (httpResponse <= 0 && attempts < maxAttempts) {
     attempts++;
     Serial0.printf("Attempt %d/%d...\n", attempts, maxAttempts);
-    
-    // Проверяем память перед каждой попыткой
-    Serial0.printf("Free heap before attempt: %d bytes\n", ESP.getFreeHeap());
     
     httpResponse = http.POST(jsonPayload);
     
     if (httpResponse <= 0) {
       Serial0.printf("HTTP error on attempt %d: %d\n", attempts, httpResponse);
       if (attempts < maxAttempts) {
-        delay(2000 * attempts); // Увеличиваем задержку с каждой попыткой
+        delay(2000 * attempts);
       }
     }
   }
   
-  // Получаем ответ
   String response = "";
   if (httpResponse > 0) {
-    if (http.getSize() > 0 && http.getSize() < 1000) {
+    if (http.getSize() > 0 && http.getSize() < 2000) {
       response = http.getString();
     }
-    Serial0.printf("Supabase response code: %d\n", httpResponse);
+    
+    Serial0.printf("=== SUPABASE RESPONSE ===\n");
+    Serial0.printf("Response code: %d\n", httpResponse);
+    
+    if (response.length() > 0) {
+      Serial0.println("Response body: " + response);
+    }
+    Serial0.println("========================\n");
     
     if (httpResponse == 200 || httpResponse == 201) {
       Serial0.println("✓ Workout sent successfully!");
+      setLEDState(LED_SUCCESS);
+      delay(3000);
+      setLEDState(LED_STANDBY);
     } else {
       Serial0.printf("✗ HTTP error. Code: %d\n", httpResponse);
-      if (response.length() > 0 && response.length() < 200) {
-        Serial0.println("Response: " + response);
+      setLEDState(LED_ERROR);
+      
+      // Детальная диагностика для 400 ошибки
+      if (httpResponse == 400) {
+        Serial0.println("400 Bad Request analysis:");
+        Serial0.println("- Checking JSON structure matches table schema");
+        Serial0.println("- Required fields: workout_start, workout_end, duration_seconds, total_distance, max_speed, avg_speed, records_count, device_name");
+        Serial0.println("- Auto fields (excluded): id, created_at");
+        
+        if (response.indexOf("duplicate") >= 0) {
+          Serial0.println("- Possible duplicate key violation");
+        }
+        if (response.indexOf("constraint") >= 0) {
+          Serial0.println("- Database constraint violation");
+        }
+        if (response.indexOf("permission") >= 0 || response.indexOf("policy") >= 0) {
+          Serial0.println("- Permission/RLS policy issue - check service_role key");
+        }
+      } else if (httpResponse == 401) {
+        Serial0.println("401 Unauthorized - Check API key permissions");
+      } else if (httpResponse == 403) {
+        Serial0.println("403 Forbidden - Check RLS policies for INSERT operation");
       }
+      
+      delay(5000);
+      setLEDState(LED_STANDBY);
     }
   } else {
     Serial0.printf("✗ Connection failed. Error code: %d\n", httpResponse);
+    setLEDState(LED_ERROR);
     
-    // Расшифровка основных SSL ошибок
+    // Диагностика сетевых ошибок
     switch (httpResponse) {
-      case -1:
-        Serial0.println("Error: Connection failed or timeout");
+      case HTTPC_ERROR_CONNECTION_REFUSED:
+        Serial0.println("Error: Connection refused - check URL");
         break;
-      case -11:
-        Serial0.println("Error: Connection refused");
+      case HTTPC_ERROR_SEND_HEADER_FAILED:
+        Serial0.println("Error: Failed to send headers");
         break;
-      case -29312:
-        Serial0.println("Error: SSL connection ended unexpectedly (EOF)");
+      case HTTPC_ERROR_SEND_PAYLOAD_FAILED:
+        Serial0.println("Error: Failed to send JSON payload");
+        break;
+      case HTTPC_ERROR_NOT_CONNECTED:
+        Serial0.println("Error: Not connected to WiFi");
+        break;
+      case HTTPC_ERROR_CONNECTION_LOST:
+        Serial0.println("Error: WiFi connection lost during request");
+        break;
+      case HTTPC_ERROR_READ_TIMEOUT:
+        Serial0.println("Error: Server response timeout");
         break;
       default:
-        Serial0.printf("Error: Unknown connection error (%d)\n", httpResponse);
+        Serial0.printf("Error: Network error code %d\n", httpResponse);
     }
+    
+    delay(5000);
+    setLEDState(LED_STANDBY);
   }
 
   http.end();
 }
 
-// HTTP задача - работает в отдельном потоке с достаточным стеком
+// HTTP задача
 void httpTask(void* parameter) {
   WorkoutData* data = nullptr;
   
   Serial0.println("HTTP Task started");
   
   while (true) {
-    if (xQueueReceive(workoutQueue, &data, portMAX_DELAY)) {
+    if (xQueueReceive(workoutQueue, &data, pdMS_TO_TICKS(30000))) {
       Serial0.println("Processing workout data...");
       
-      // Проверяем память перед отправкой
       Serial0.printf("Free heap before HTTP: %d bytes\n", ESP.getFreeHeap());
       
       sendWorkoutToSupabaseFromTask(data);
       
-      // Освобождаем память
       delete data;
       data = nullptr;
       
       Serial0.printf("Free heap after HTTP: %d bytes\n", ESP.getFreeHeap());
+    } else {
+      // Queue timeout - check if LED is stuck in SENDING state
+      if (currentLEDState == LED_SENDING) {
+        Serial0.println(">>> Queue timeout detected - resetting LED to STANDBY");
+        setLEDState(LED_STANDBY);
+      }
     }
     
-    // Небольшая задержка для других задач
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
@@ -303,140 +573,97 @@ void sendWorkoutToSupabase() {
     return;
   }
   
-  // Проверяем свободную память более строго
-  const int MIN_MEMORY_FOR_HTTP = 15000; // Увеличено для SSL
+  const int MIN_MEMORY_FOR_HTTP = 20000;
   if (ESP.getFreeHeap() < MIN_MEMORY_FOR_HTTP) {
     Serial0.printf("Low memory for HTTP - skipping. Free: %d, Required: %d\n",
                   ESP.getFreeHeap(), MIN_MEMORY_FOR_HTTP);
+    setLEDState(LED_ERROR);
+    delay(3000);
+    setLEDState(LED_STANDBY);
     return;
   }
 
   Serial0.printf("Memory check OK: %d bytes free\n", ESP.getFreeHeap());
-  
   Serial0.println(">>> PREPARING TO SEND TO SUPABASE!");
+  setLEDState(LED_SENDING);
   
-  // Создаем копию данных для передачи в HTTP задачу
   WorkoutData* data = new WorkoutData();
-  data->buffer = workoutBuffer; // Копируем буфер
+  data->buffer = workoutBuffer;
   data->startTime = workoutStartTime;
   data->endTime = workoutEndTime;
   
-  // Отправляем в очередь HTTP задачи
-  if (xQueueSend(workoutQueue, &data, pdMS_TO_TICKS(1000)) == pdTRUE) {
-    workoutBuffer.clear(); // Очищаем исходный буфер
+  if (xQueueSend(workoutQueue, &data, pdMS_TO_TICKS(100)) == pdTRUE) {
+    workoutBuffer.clear();
     Serial0.println(">>> Workout queued for sending");
   } else {
-    delete data; // Если не удалось отправить - освобождаем память
+    delete data;
     Serial0.println(">>> Failed to queue workout - queue full");
+    setLEDState(LED_ERROR);
+    delay(2000);
+    setLEDState(LED_STANDBY);
   }
 }
 
 void updateWorkoutState(const WorkoutRecord& record) {
   previousState = currentState;
   
-  bool isCurrentlyActive = (record.speed > 0.1 && record.time > 0);
+  // Понижены пороги активности для обнаружения медленной ходьбы
+  bool isCurrentlyActive = (record.speed >= MIN_WORKOUT_SPEED && record.time > 0);
 
-// Игнорируем очень низкие скорости как шум
-if (record.speed < 0.5) {
-  isCurrentlyActive = false;
-}
-  
   if (isCurrentlyActive) {
     lastActiveTime = millis();
     if (currentState == STANDBY && (millis() - workoutEndTime_millis > WORKOUT_COOLDOWN)) {
-      // Требуем стабильную активность минимум 3 секунды перед началом записи
-      static unsigned long firstActiveDetection = 0;
-      static float stableSpeedSum = 0.0;
-      static int stableSpeedCount = 0;
+      currentState = ACTIVE;
+      setLEDState(LED_ACTIVE);
       
-      if (firstActiveDetection == 0) {
-        firstActiveDetection = millis();
-        stableSpeedSum = record.speed;
-        stableSpeedCount = 1;
+      time_t currentTime = time(nullptr);
+      
+      if (isTimeValid(currentTime)) {
+        workoutStartTime = currentTime;
+        actualWorkoutStartTime = millis();
+        Serial0.println(">>> WORKOUT START DELAY: 5 seconds before counting");
+        Serial0.printf(">>> WORKOUT STARTED at %s! Speed: %.1f km/h\n",
+                       getReadableTime(workoutStartTime).c_str(), record.speed);
       } else {
-        stableSpeedSum += record.speed;
-        stableSpeedCount++;
-        
-        // Проверяем стабильность активности в течение 3 секунд
-        if (millis() - firstActiveDetection >= 3000) {
-          float avgStableSpeed = stableSpeedSum / stableSpeedCount;
-          
-          if (avgStableSpeed >= 1.0) { // Средняя скорость должна быть минимум 1 км/ч
-            currentState = ACTIVE;
-            
-            time_t currentTime = time(nullptr);
-            
-            if (isTimeValid(currentTime)) {
-              workoutStartTime = currentTime;
-              Serial0.printf(">>> WORKOUT STARTED at %s! (Avg speed during detection: %.1f km/h)\n",
-                             getReadableTime(workoutStartTime).c_str(), avgStableSpeed);
-            } else {
-              Serial0.printf(">>> WARNING: Invalid time detected (%ld), waiting for NTP sync...\n", currentTime);
-              currentState = STANDBY;
-              firstActiveDetection = 0;
-              return;
-            }
-            
-            // Сбрасываем счетчики при начале новой тренировки
-            totalDistance = 0.0;
-            sessionStartTime = millis();
-            lastTimeUpdate = millis();
-          }
-          
-          // Сбрасываем детектор в любом случае
-          firstActiveDetection = 0;
-          stableSpeedSum = 0.0;
-          stableSpeedCount = 0;
-        }
+        Serial0.printf(">>> WARNING: Invalid time detected (%ld), waiting for sync...\n", currentTime);
+        currentState = STANDBY;
+        setLEDState(LED_STANDBY);
+        return;
       }
-    } else {
-      // Сбрасываем детектор активности если движение прекратилось
-      static unsigned long firstActiveDetection = 0;
-      firstActiveDetection = 0;
+      
+      totalDistance = 0.0;
+      sessionStartTime = millis();
+      lastTimeUpdate = millis();
     }
   } else {
     unsigned long inactiveTime = millis() - lastActiveTime;
     
-    if (currentState == ACTIVE && inactiveTime > STANDBY_TIMEOUT) {
-      // Дополнительная проверка: если скорость ниже 0.5 км/ч более 10 секунд - завершаем
-      static unsigned long lowSpeedStartTime = 0;
+    if (currentState == ACTIVE && record.speed < 0.1 && inactiveTime > 15000) {
+      Serial0.printf(">>> Ending workout due to zero speed for 15+ seconds\n");
       
-      if (record.speed < 0.5) {
-        if (lowSpeedStartTime == 0) {
-          lowSpeedStartTime = millis();
-        } else if (millis() - lowSpeedStartTime > 10000) { // 10 секунд низкой скорости
-          Serial0.printf(">>> Ending workout due to prolonged low speed (%.1f km/h)\n", record.speed);
-          lowSpeedStartTime = 0; // Сброс для следующего раза
-        } else {
-          return; // Продолжаем ждать
-        }
-      } else {
-        lowSpeedStartTime = 0; // Сброс если скорость поднялась
-        return; // Не завершаем тренировку если скорость нормальная
-      }
       time_t currentTime = time(nullptr);
       
-      // ПРОВЕРЯЕМ ВАЛИДНОСТЬ ВРЕМЕНИ ПЕРЕД ОКОНЧАНИЕМ
       if (isTimeValid(currentTime) && isTimeValid(workoutStartTime)) {
         workoutEndTime = currentTime;
         
-        // ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: длительность не должна быть больше 24 часов
         long duration = workoutEndTime - workoutStartTime;
-        if (duration > 86400) { // 24 часа в секундах
+        if (duration < 30 || duration > 86400) {
           Serial0.printf(">>> WARNING: Invalid workout duration (%ld sec), skipping save\n", duration);
           currentState = STANDBY;
+          setLEDState(LED_STANDBY);
           workoutBuffer.clear();
           totalDistance = 0.0;
           return;
         }
         
         currentState = WORKOUT_ENDED;
-        workoutEndTime_millis = millis(); // Сохраняем время окончания в миллисекундах
+        workoutEndTime_millis = millis();
         Serial0.printf(">>> WORKOUT ENDED at %s! Duration: %ld seconds\n",
                        getReadableTime(workoutEndTime).c_str(), duration);
       } else {
         Serial0.printf(">>> WARNING: Invalid time for workout end, discarding workout\n");
         currentState = STANDBY;
+        setLEDState(LED_STANDBY);
         workoutBuffer.clear();
         totalDistance = 0.0;
         return;
@@ -445,15 +672,20 @@ if (record.speed < 0.5) {
   }
   
   if (previousState == ACTIVE && currentState == WORKOUT_ENDED) {
-    sendWorkoutToSupabase(); // Теперь безопасно через очередь
+    Serial0.println(">>> Starting workout upload process...");
+    setLEDState(LED_SENDING);
+    Serial0.println(">>> LED set to SENDING state");
+    sendWorkoutToSupabase();
+    Serial0.println(">>> sendWorkoutToSupabase() completed");
     currentState = STANDBY;
+    setLEDState(LED_STANDBY);
+    Serial0.println(">>> State changed to STANDBY, LED set to STANDBY");
   }
 }
 
 void addToBuffer(const WorkoutRecord& record) {
   static WorkoutRecord lastRecord = {0};
   
-  // ПРОВЕРЯЕМ ВАЛИДНОСТЬ ВРЕМЕНИ В ЗАПИСИ
   if (!isTimeValid(record.timestamp)) {
     Serial0.printf("Skipping record with invalid timestamp: %ld\n", record.timestamp);
     return;
@@ -463,7 +695,7 @@ void addToBuffer(const WorkoutRecord& record) {
                    record.speed != lastRecord.speed ||
                    record.time != lastRecord.time);
   
-  if (shouldAdd && currentState == ACTIVE) {
+  if (shouldAdd && currentState == ACTIVE && (millis() - actualWorkoutStartTime > workoutStartDelay)) {
     if (workoutBuffer.size() >= MAX_BUFFER_SIZE) {
       workoutBuffer.erase(workoutBuffer.begin());
     }
@@ -486,24 +718,23 @@ void treadmillDataCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
   std::vector<uint8_t> currentDataVec(pData, pData + length);
   
   // Выводим RAW DATA только при изменении данных
-  if (currentDataVec != lastData) {
+  if (RAW && currentDataVec != lastData) {
     Serial0.print("RAW DATA: ");
     for (size_t i = 0; i < length; i++) {
       Serial0.printf("%02X ", pData[i]);
     }
     Serial0.println();
     
-    Serial0.printf("Analysis: Flags=0x%04X, Bytes[2-3]=0x%04X (%d), Bytes[4-6]=0x%06X, Bytes[16-17]=0x%04X (%d)\n",
+    Serial0.printf("Analysis: Flags=0x%04X, Speed=0x%04X (%d), Distance=0x%06X, Time=0x%04X (%d)\n",
                   pData[0] | (pData[1] << 8),
                   pData[2] | (pData[3] << 8), pData[2] | (pData[3] << 8),
                   length >= 7 ? (pData[4] | (pData[5] << 8) | (pData[6] << 16)) : 0,
                   length >= 18 ? (pData[16] | (pData[17] << 8)) : 0,
                   length >= 18 ? (pData[16] | (pData[17] << 8)) : 0);
-    
-    lastData = currentDataVec;
   }
   
-  uint16_t flags = pData[0] | (pData[1] << 8);
+  lastData = currentDataVec;
+  
   WorkoutRecord newRecord;
   newRecord.timestamp = time(nullptr);
   newRecord.speed = 0.0;
@@ -515,17 +746,7 @@ void treadmillDataCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
     uint16_t speedRaw = pData[2] | (pData[3] << 8);
     newRecord.speed = speedRaw / 100.0;
     
-    // Фильтр шума - скорости менее 0.3 км/ч считаем нулевыми
-    if (newRecord.speed < 0.3) {
-      newRecord.speed = 0.0;
-    }
-  }
-  
-  // Парсинг дистанции
-  uint32_t packetDistance = 0;
-  if (length >= 7) {
-    uint32_t distanceRaw = pData[4] | (pData[5] << 8) | (pData[6] << 16);
-    packetDistance = distanceRaw;
+    // Убрали фильтр низких скоростей для поддержки медленной ходьбы
   }
   
   // Парсинг времени
@@ -534,20 +755,19 @@ void treadmillDataCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
     newRecord.time = timeRaw;
   }
   
-  // Вычисление общей дистанции на основе скорости и времени
-  if (newRecord.speed > 0.1 && lastTimeUpdate > 0) {
+  // Вычисление дистанции на основе скорости и времени
+  if (newRecord.speed >= MIN_ACTIVITY_SPEED && lastTimeUpdate > 0 && currentState == ACTIVE && (millis() - actualWorkoutStartTime > workoutStartDelay)) {
     unsigned long timeInterval = millis() - lastTimeUpdate;
     if (timeInterval > 100 && timeInterval < 10000) {
       float distanceInterval = (newRecord.speed / 3.6) * (timeInterval / 1000.0);
       totalDistance += distanceInterval;
       
-      // Выводим расчеты только когда есть движение
       Serial0.printf("CALCULATED: Interval=%.1fs, Distance+=%.2fm, Total=%.1fm\n",
                     timeInterval / 1000.0, distanceInterval, totalDistance);
     }
   }
   
-  if (newRecord.speed > 0.1) {
+  if (newRecord.speed >= MIN_ACTIVITY_SPEED && currentState == ACTIVE && (millis() - actualWorkoutStartTime > workoutStartDelay)) {
     lastTimeUpdate = millis();
   }
   
@@ -557,15 +777,15 @@ void treadmillDataCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
     newRecord.speed = 0.0;
   }
   
-  newRecord.isActive = (newRecord.speed > 0.1 && newRecord.time > 0);
+  newRecord.isActive = (newRecord.speed >= MIN_ACTIVITY_SPEED && newRecord.time > 0);
   
   updateWorkoutState(newRecord);
   addToBuffer(newRecord);
   
-  // Выводим основную информацию только при изменениях или активности
+  // Выводим основную информацию
   static WorkoutRecord lastDisplayed = {0};
   static bool wasActive = false;
-  bool isActive = (newRecord.speed > 0.1);
+  bool isActive = (newRecord.speed >= MIN_ACTIVITY_SPEED);
   
   if ((isActive != wasActive) ||
       (isActive && (newRecord.speed != lastDisplayed.speed ||
@@ -586,49 +806,55 @@ void setup() {
   Serial0.begin(115200);
   delay(3000);
   
-  Serial0.println("ESP32-S3 Treadmill Logger v2.5 - Anti-Multiple Sessions");
-  workoutEndTime_millis = millis(); // Инициализируем время окончания
+  // Инициализация NeoPixel
+  pixels.begin();
+  pixels.clear();
+  pixels.show();
+  setLEDState(LED_CONNECTING);
+  
+  Serial0.println("ESP32-S3 Treadmill Logger v3.2 - Fixed Supabase Structure");
+  RAW = false; // для включения RAW данных
+  Serial0.printf("Activity thresholds: MIN_WORKOUT=%.1f km/h, MIN_ACTIVITY=%.1f km/h\n", 
+                 MIN_WORKOUT_SPEED, MIN_ACTIVITY_SPEED);
+  workoutEndTime_millis = millis();
   Serial0.printf("Free heap at start: %d bytes\n", ESP.getFreeHeap());
   
-  // СОЗДАЕМ HTTP ЗАДАЧУ И ОЧЕРЕДЬ ПЕРВЫМИ
+  // Создание HTTP задачи и очереди
   Serial0.println("Creating HTTP task and queue...");
-  workoutQueue = xQueueCreate(3, sizeof(WorkoutData*)); // Очередь на 3 элемента
+  workoutQueue = xQueueCreate(3, sizeof(WorkoutData*));
   
   if (workoutQueue == nullptr) {
     Serial0.println("Failed to create workout queue!");
+    setLEDState(LED_ERROR);
     return;
   }
   
   BaseType_t result = xTaskCreatePinnedToCore(
-    httpTask,           // Функция задачи
-    "HTTP_Task",        // Имя задачи
-    16384,              // Размер стека (16KB) - увеличено для SSL
-    nullptr,            // Параметр
-    2,                  // Приоритет (выше чем у loop)
-    &httpTaskHandle,    // Хендл задачи
-    0                   // Ядро 0 (BLE обычно на ядре 1)
+    httpTask,
+    "HTTP_Task",
+    20480,
+    nullptr,
+    2,
+    &httpTaskHandle,
+    0
   );
   
   if (result != pdPASS) {
     Serial0.println("Failed to create HTTP task!");
+    setLEDState(LED_ERROR);
     return;
   }
   
   Serial0.println("HTTP task created successfully");
   
+  // Подключение к WiFi с несколькими попытками
   Serial0.println("Connecting to WiFi...");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial0.print(".");
-  }
-  Serial0.println("\nWiFi OK!");
+  reconnectWiFi();
   
-  // Настройка NTP для получения точного времени
+  // Настройка NTP
   Serial0.println("Getting time from NTP...");
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 
-  // ЖДЕМ СИНХРОНИЗАЦИИ ВРЕМЕНИ
   int ntpAttempts = 0;
   struct tm timeinfo;
   while (!getLocalTime(&timeinfo) && ntpAttempts < 20) {
@@ -644,18 +870,26 @@ void setup() {
     Serial0.printf("\nCurrent time: %s (timestamp: %ld)\n",
                   getReadableTime(currentTime).c_str(), currentTime);
     
-    // Проверяем валидность полученного времени
     if (!isTimeValid(currentTime)) {
       Serial0.println("WARNING: Received invalid time from NTP!");
     }
   }
 
-  // ИНИЦИАЛИЗИРУЕМ ВРЕМЕННЫЕ ПЕРЕМЕННЫЕ НУЛЕВЫМИ ЗНАЧЕНИЯМИ
   workoutStartTime = 0;
   workoutEndTime = 0;
   workoutEndTime_millis = millis();
   
+  // Тестирование Supabase только если есть WiFi
+  if (wifiConnected) {
+    testSupabaseConnection();
+  } else {
+    Serial0.println("Skipping Supabase test - no WiFi");
+  }
+  
+  // Подключение к беговой дорожке
   Serial0.println("Connecting to treadmill...");
+  setLEDState(LED_CONNECTING);
+  
   BLEDevice::init("");
   pClient = BLEDevice::createClient();
   
@@ -669,44 +903,53 @@ void setup() {
         pTreadmillData->registerForNotify(treadmillDataCallback);
         Serial0.println("Ready to log workouts!");
         connected = true;
+        setLEDState(LED_SUCCESS);
+        delay(2000);
+        setLEDState(LED_STANDBY);
       }
     }
+  } else {
+    Serial0.println("Failed to connect to treadmill!");
+    setLEDState(LED_ERROR);
   }
   
   Serial0.printf("Setup complete. Free heap: %d bytes\n", ESP.getFreeHeap());
 }
 
 void loop() {
+  // Обновляем NeoPixel в каждом цикле
+  updateNeoPixel();
+  
   if (connected && pClient->isConnected()) {
     static unsigned long lastStatus = 0;
     
-    // Проверка соединения каждые 5 секунд
+    // Проверка соединений каждые 5 секунд
     if (millis() - lastConnectionCheck > CONNECTION_CHECK_INTERVAL) {
       lastConnectionCheck = millis();
       
-      // ПРОВЕРЯЕМ АКТУАЛЬНОСТЬ СИСТЕМНОГО ВРЕМЕНИ
+      // Проверяем WiFi и пытаемся переподключиться при необходимости
+      if (WiFi.status() != WL_CONNECTED && wifiConnected) {
+        Serial0.println("WiFi lost - attempting reconnection");
+        wifiConnected = false;
+        setLEDState(LED_WIFI_ERROR);
+      } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
+        Serial0.println("WiFi restored");
+        wifiConnected = true;
+        if (currentLEDState == LED_WIFI_ERROR) {
+          setLEDState(LED_STANDBY);
+        }
+      }
+      
+      // Проверяем системное время
       time_t currentTime = time(nullptr);
       if (!isTimeValid(currentTime)) {
         Serial0.printf("WARNING: System time is invalid: %ld\n", currentTime);
-        
-        // Пытаемся пересинхронизировать время
         configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
       }
       
       // Проверяем память
-      if (ESP.getFreeHeap() < 8000) {
+      if (ESP.getFreeHeap() < 10000) {
         Serial0.printf("WARNING: Low memory! Free heap: %d bytes\n", ESP.getFreeHeap());
-      }
-
-      // Проверяем качество WiFi соединения
-      int rssi = WiFi.RSSI();
-      if (rssi < -80) {
-        Serial0.printf("Weak WiFi signal: %d dBm\n", rssi);
-      }
-
-      if (WiFi.status() != WL_CONNECTED) {
-        Serial0.println("WiFi disconnected - attempting reconnection");
-        WiFi.reconnect();
       }
       
       if (currentState == STANDBY && (millis() - workoutEndTime_millis < WORKOUT_COOLDOWN)) {
@@ -714,25 +957,35 @@ void loop() {
         Serial0.printf("COOLDOWN: %lu seconds remaining\n", remaining);
       }
       
-      // Если долго в активном состоянии без данных - сбрасываем
+      // Принудительный сброс при долгой неактивности
       if (currentState == ACTIVE && (millis() - lastActiveTime > STANDBY_TIMEOUT * 2)) {
         Serial0.println("Force reset to STANDBY - no activity detected");
         currentState = STANDBY;
+        setLEDState(LED_STANDBY);
         workoutBuffer.clear();
         totalDistance = 0.0;
+      }
+      
+      // Попытка переподключения WiFi каждые 2 минуты если его нет
+      static unsigned long lastWiFiAttempt = 0;
+      if (!wifiConnected && (millis() - lastWiFiAttempt > 120000)) {
+        reconnectWiFi();
+        lastWiFiAttempt = millis();
       }
     }
     
     if (currentState == STANDBY && (millis() - lastStatus > 60000)) {
-      Serial0.printf("STANDBY (waiting) - %s, Free RAM: %d\n", 
+      Serial0.printf("STANDBY (waiting) - %s, WiFi: %s, Free RAM: %d\n", 
                      getReadableTime(time(nullptr)).c_str(),
+                     wifiConnected ? "OK" : "NO",
                      ESP.getFreeHeap());
       lastStatus = millis();
     }
     
-    delay(1000);
+    delay(100);
   } else {
-    Serial0.println("Reconnecting...");
+    Serial0.println("Reconnecting to treadmill...");
+    setLEDState(LED_ERROR);
     connected = false;
     delay(5000);
   }
