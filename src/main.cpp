@@ -10,6 +10,7 @@
 #include <vector>
 #include <Adafruit_NeoPixel.h>
 #include "config.h"
+#include <ESPAsyncWebServer.h>
 
 bool RAW = false;
 
@@ -33,7 +34,9 @@ Adafruit_NeoPixel pixels(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 #define COLOR_WIFI_ERROR  pixels.Color(255, 255, 0)   // Жёлтый - проблемы с WiFi
 
 // NTP сервера
-const char* ntpServer = "pool.ntp.org";
+const char* ntpServer1 = "ntp2.vniiftri.ru";
+const char* ntpServer2 = "ntp.ix.ru";
+const char* ntpServer3 = "ntp.msk-ix.ru";
 const long gmtOffset_sec = 3 * 3600;     // МСК = UTC+3
 const int daylightOffset_sec = 0;
 
@@ -49,6 +52,15 @@ const float MIN_WORKOUT_SPEED = 0.5;     // 0.5 км/ч для начала тр
 BLEAddress treadmillAddress(TREADMILL_MAC);
 bool connected = false;
 bool wifiConnected = false;
+
+AsyncWebServer webServer(80);
+float webCurrentSpeed = 0.0;
+uint32_t webCurrentDistance = 0;
+uint16_t webCurrentTime = 0;
+String webCurrentState = "STANDBY";
+time_t webSessionDuration = 0;
+unsigned long lastWebUpdate = 0;
+const unsigned long WEB_UPDATE_INTERVAL = 2000;
 
 BLEClient* pClient = nullptr;
 BLERemoteCharacteristic* pTreadmillData = nullptr;
@@ -188,6 +200,168 @@ void setLEDState(LEDState newState) {
   }
 }
 
+const char* webPageHTML = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Тренировочный монитор ESP32-S3</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f0f0f0;
+        }
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .header {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+        }
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px;
+            margin: 10px 0;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid #007bff;
+        }
+        .metric.active {
+            border-left-color: #28a745;
+            background: #d4edda;
+        }
+        .metric-label {
+            font-weight: bold;
+            color: #495057;
+        }
+        .metric-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #212529;
+        }
+        .status {
+            text-align: center;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 20px 0;
+            font-weight: bold;
+        }
+        .status.standby { background: #cce7ff; color: #0066cc; }
+        .status.active { background: #ccffcc; color: #006600; }
+        .status.ended { background: #ffffcc; color: #cc6600; }
+        .update-time {
+            text-align: center;
+            color: #666;
+            font-size: 14px;
+            margin-top: 20px;
+        }
+        .progress {
+            width: 100%;
+            height: 10px;
+            background: #e0e0e0;
+            border-radius: 5px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #007bff, #28a745);
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="header">🏃 Тренировочный Монитор</h1>
+        
+        <div id="status" class="status standby">ОЖИДАНИЕ</div>
+        
+        <div id="speed-metric" class="metric">
+            <span class="metric-label">Скорость:</span>
+            <span class="metric-value"><span id="speed">0.0</span> км/ч</span>
+        </div>
+        
+        <div id="distance-metric" class="metric">
+            <span class="metric-label">Дистанция:</span>
+            <span class="metric-value"><span id="distance">0</span> м</span>
+        </div>
+        
+        <div id="time-metric" class="metric">
+            <span class="metric-label">Время тренировки:</span>
+            <span class="metric-value"><span id="duration">00:00</span></span>
+        </div>
+        
+        <div class="progress">
+            <div id="progress-bar" class="progress-bar"></div>
+        </div>
+        
+        <div class="update-time">
+            Последнее обновление: <span id="lastUpdate">-</span>
+        </div>
+    </div>
+
+    <script>
+        function updateData() {
+            fetch('/data')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('speed').textContent = data.speed;
+                    document.getElementById('distance').textContent = data.distance;
+                    document.getElementById('duration').textContent = formatTime(data.duration);
+                    
+                    const statusEl = document.getElementById('status');
+                    statusEl.textContent = data.state;
+                    statusEl.className = 'status ' + data.state.toLowerCase();
+                    
+                    const speedMetric = document.getElementById('speed-metric');
+                    const distanceMetric = document.getElementById('distance-metric');
+                    const timeMetric = document.getElementById('time-metric');
+                    
+                    if (data.state === 'ACTIVE') {
+                        speedMetric.classList.add('active');
+                        distanceMetric.classList.add('active');
+                        timeMetric.classList.add('active');
+                        
+                        const progress = Math.min((data.speed / 15) * 100, 100);
+                        document.getElementById('progress-bar').style.width = progress + '%';
+                    } else {
+                        speedMetric.classList.remove('active');
+                        distanceMetric.classList.remove('active');
+                        timeMetric.classList.remove('active');
+                        document.getElementById('progress-bar').style.width = '0%';
+                    }
+                    
+                    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('ru-RU');
+                })
+                .catch(error => {
+                    console.error('Ошибка получения данных:', error);
+                });
+        }
+        
+        function formatTime(seconds) {
+            const mins = Math.floor(seconds / 60);
+            const secs = seconds % 60;
+            return mins.toString().padStart(2, '0') + ':' + secs.toString().padStart(2, '0');
+        }
+        
+        setInterval(updateData, 3000); // Обновляем каждые 3 секунды вместо 2
+        updateData();
+    </script>
+</body>
+</html>
+)rawliteral";
+
 // Функция проверки валидности времени
 bool isTimeValid(time_t timeValue) {
   const time_t MIN_VALID_TIME = 1577836800; // 1 января 2020
@@ -219,7 +393,7 @@ void reconnectWiFi() {
     delay(1000);
     
     // Пересинхронизируем время после подключения WiFi
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2, ntpServer3);
   } else {
     Serial0.println("\nWiFi reconnection failed");
     wifiConnected = false;
@@ -777,6 +951,24 @@ void treadmillDataCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_
   }
   
   newRecord.isActive = (newRecord.speed >= MIN_ACTIVITY_SPEED && newRecord.time > 0);
+
+  // Обновляем данные для веб-интерфейса только раз в 2 секунды
+  unsigned long currentTimeMs = millis();
+  if (currentTimeMs - lastWebUpdate > WEB_UPDATE_INTERVAL) {
+    webCurrentSpeed = newRecord.speed;
+    webCurrentDistance = newRecord.distance;
+    webCurrentTime = newRecord.time;
+    webCurrentState = (currentState == STANDBY ? "STANDBY" :
+                      (currentState == ACTIVE ? "ACTIVE" : "ENDED"));
+    
+    if (currentState == ACTIVE && workoutStartTime > 0) {
+      webSessionDuration = time(nullptr) - workoutStartTime;
+    } else {
+      webSessionDuration = 0;
+    }
+    
+    lastWebUpdate = currentTimeMs;
+  }
   
   updateWorkoutState(newRecord);
   addToBuffer(newRecord);
@@ -843,6 +1035,9 @@ void setup() {
     setLEDState(LED_ERROR);
     return;
   }
+
+  // Понижаем приоритет веб-сервера чтобы не мешал BLE
+  vTaskPrioritySet(NULL, 1); // Понижаем приоритет main task с веб-сервером
   
   Serial0.println("HTTP task created successfully");
   
@@ -852,7 +1047,7 @@ void setup() {
   
   // Настройка NTP
   Serial0.println("Getting time from NTP...");
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2, ntpServer3);
 
   int ntpAttempts = 0;
   struct tm timeinfo;
@@ -883,6 +1078,35 @@ void setup() {
     testSupabaseConnection();
   } else {
     Serial0.println("Skipping Supabase test - no WiFi");
+  }
+
+  Serial0.println("Starting web server...");
+
+  webServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", webPageHTML);
+  });
+
+  webServer.on("/data", HTTP_GET, [](AsyncWebServerRequest *request){
+    // Статический буфер для JSON
+    static char jsonBuffer[200];
+    String stateCopy = webCurrentState;
+    snprintf(jsonBuffer, sizeof(jsonBuffer),
+      "{\"speed\":%.1f,\"distance\":%u,\"time\":%u,\"duration\":%ld,\"state\":\"%s\",\"free_heap\":%u}",
+      webCurrentSpeed, webCurrentDistance, webCurrentTime, webSessionDuration,
+      stateCopy.c_str(), ESP.getFreeHeap());
+      
+    request->send(200, "application/json", jsonBuffer);
+  });
+
+  // Настройка для минимального влияния на производительность
+  webServer.onNotFound([](AsyncWebServerRequest *request){
+    request->send(404, "text/plain", "Not found");
+  });
+
+  webServer.begin();
+  Serial0.println("Web server started!");
+  if (wifiConnected) {
+    Serial0.printf("Open http://%s in your browser\n", WiFi.localIP().toString().c_str());
   }
   
   // Подключение к беговой дорожке
@@ -916,6 +1140,18 @@ void setup() {
 }
 
 void loop() {
+  // Отключаем веб-сервер при критически низкой памяти
+  static bool webServerRunning = true;
+  if (ESP.getFreeHeap() < 15000 && webServerRunning) {
+    Serial0.println("Low memory - temporarily disabling web server");
+    webServer.end();
+    webServerRunning = false;
+  } else if (ESP.getFreeHeap() > 25000 && !webServerRunning) {
+    Serial0.println("Memory recovered - restarting web server");
+    webServer.begin();
+    webServerRunning = true;
+  }
+
   // Обновляем NeoPixel в каждом цикле
   updateNeoPixel();
   
@@ -943,7 +1179,7 @@ void loop() {
       time_t currentTime = time(nullptr);
       if (!isTimeValid(currentTime)) {
         Serial0.printf("WARNING: System time is invalid: %ld\n", currentTime);
-        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2, ntpServer3);
       }
       
       // Проверяем память
